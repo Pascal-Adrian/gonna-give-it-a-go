@@ -67,9 +67,12 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// isGID reports whether s is a string of decimal digits, the shape of every
-// Asana resource id.
+// isGID reports whether s is a non-empty string of decimal digits, the shape
+// of every Asana resource id.
 func isGID(s string) bool {
+	if s == "" {
+		return false
+	}
 	for _, r := range s {
 		if r < '0' || r > '9' {
 			return false

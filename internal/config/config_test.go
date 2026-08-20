@@ -143,3 +143,21 @@ func unset(t *testing.T, key string) {
 		t.Fatalf("unsetting %s: %v", key, err)
 	}
 }
+
+func TestIsGID(t *testing.T) {
+	tests := map[string]bool{
+		"1201234567890123": true,
+		"0":                true,
+		"":                 false,
+		"12a":              false,
+		"Acme Inc":         false,
+		"-1":               false,
+		" 12":              false,
+	}
+
+	for input, want := range tests {
+		if got := isGID(input); got != want {
+			t.Errorf("isGID(%q) = %v, want %v", input, got, want)
+		}
+	}
+}

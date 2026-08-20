@@ -3,10 +3,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/Pascal-Adrian/gonna-give-it-a-go/internal/asana"
 	"github.com/Pascal-Adrian/gonna-give-it-a-go/internal/config"
 )
 
@@ -21,11 +25,28 @@ func main() {
 }
 
 func run(log *slog.Logger) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-
 	log.Info("configuration loaded", "workspace", cfg.WorkspaceGID, "out_dir", cfg.OutDir)
+
+	client := asana.New(cfg.Token, cfg.WorkspaceGID, log)
+
+	users, err := client.Users(ctx)
+	if err != nil {
+		return err
+	}
+	log.Info("fetched users", "count", len(users))
+
+	projects, err := client.Projects(ctx)
+	if err != nil {
+		return err
+	}
+	log.Info("fetched projects", "count", len(projects))
+
 	return nil
 }
