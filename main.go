@@ -12,6 +12,8 @@ import (
 
 	"github.com/Pascal-Adrian/gonna-give-it-a-go/internal/asana"
 	"github.com/Pascal-Adrian/gonna-give-it-a-go/internal/config"
+	"github.com/Pascal-Adrian/gonna-give-it-a-go/internal/extract"
+	"github.com/Pascal-Adrian/gonna-give-it-a-go/internal/store"
 )
 
 func main() {
@@ -35,18 +37,5 @@ func run(log *slog.Logger) error {
 	log.Info("configuration loaded", "workspace", cfg.WorkspaceGID, "out_dir", cfg.OutDir)
 
 	client := asana.New(cfg.Token, cfg.WorkspaceGID, log)
-
-	users, err := client.Users(ctx)
-	if err != nil {
-		return err
-	}
-	log.Info("fetched users", "count", len(users))
-
-	projects, err := client.Projects(ctx)
-	if err != nil {
-		return err
-	}
-	log.Info("fetched projects", "count", len(projects))
-
-	return nil
+	return extract.New(client, store.New(cfg.OutDir), log).Run(ctx)
 }
