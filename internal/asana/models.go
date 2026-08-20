@@ -31,11 +31,12 @@ type Project struct {
 	Archived    bool       `json:"archived"`
 	Completed   bool       `json:"completed"`
 	CompletedAt *time.Time `json:"completed_at"`
-	CreatedAt   time.Time  `json:"created_at"`
-	ModifiedAt  time.Time  `json:"modified_at"`
-	// due_on and start_on are calendar dates, not timestamps.
-	DueOn         string  `json:"due_on"`
-	StartOn       string  `json:"start_on"`
+	CreatedAt   *time.Time `json:"created_at"`
+	ModifiedAt  *time.Time `json:"modified_at"`
+	// Calendar dates, not timestamps. Pointers so an unset date stays null in
+	// the output rather than becoming an empty string we invented.
+	DueOn         *string `json:"due_on"`
+	StartOn       *string `json:"start_on"`
 	Notes         string  `json:"notes"`
 	Public        bool    `json:"public"`
 	PermalinkURL  string  `json:"permalink_url"`

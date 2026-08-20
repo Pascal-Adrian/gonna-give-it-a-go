@@ -21,9 +21,10 @@ const (
 	defaultBaseURL = "https://app.asana.com/api/1.0"
 
 	// Asana allows 150 requests per minute on the free tier, 1500 on paid
-	// plans. A burst of 1 spreads requests evenly, so no 60 second window can
-	// hold more than the limit even across a window boundary.
-	requestsPerMinute = 150
+	// plans. A burst of 1 spreads requests evenly; the margin below the cap is
+	// deliberate, since pacing at exactly 150 puts ticks at both ends of a
+	// closed 60 second window and so allows 151 requests inside it.
+	requestsPerMinute = 145
 
 	pageSize       = 100 // Asana's maximum.
 	maxAttempts    = 3
@@ -31,6 +32,11 @@ const (
 
 	defaultRetryAfter = time.Second
 	maxRetryAfter     = time.Minute
+
+	// Caps on how much of a response body we are willing to read when it is
+	// not the payload we asked for.
+	maxDrainBytes = 1 << 20
+	maxErrorBody  = 1 << 20
 
 	// noRetry distinguishes a final error from a retry after no delay.
 	noRetry = -1
@@ -80,6 +86,7 @@ func fetchAll[T any](ctx context.Context, c *Client, path string, q url.Values) 
 	q.Set("workspace", c.workspace)
 	q.Set("limit", strconv.Itoa(pageSize))
 
+	seen := map[string]bool{}
 	var all []T
 	for {
 		var p page[T]
@@ -91,10 +98,12 @@ func fetchAll[T any](ctx context.Context, c *Client, path string, q url.Values) 
 		if p.NextPage == nil || p.NextPage.Offset == "" {
 			return all, nil
 		}
-		// An offset that does not advance would loop forever, burning quota.
-		if p.NextPage.Offset == q.Get("offset") {
+		// Any repeat, not just a consecutive one, means the server is cycling
+		// offsets; the walk would otherwise spin at full request rate.
+		if seen[p.NextPage.Offset] {
 			return nil, fmt.Errorf("GET %s: pagination stalled at offset %s", path, p.NextPage.Offset)
 		}
+		seen[p.NextPage.Offset] = true
 		q.Set("offset", p.NextPage.Offset)
 	}
 }
@@ -184,18 +193,34 @@ func backoff(attempt int) time.Duration {
 	return baseBackoff << (attempt - 1)
 }
 
-// retryAfter reads the header Asana sends with a 429, in seconds.
+// retryAfter reads the header sent with a 429. Asana documents seconds, but an
+// intermediary in front of it may send the RFC 7231 date form instead, and
+// falling back to a one second default there would burn every attempt in
+// moments.
 func retryAfter(header string) time.Duration {
-	seconds, err := strconv.Atoi(strings.TrimSpace(header))
-	if err != nil || seconds < 0 {
-		return defaultRetryAfter
+	header = strings.TrimSpace(header)
+
+	if seconds, err := strconv.Atoi(header); err == nil {
+		if seconds < 0 {
+			return defaultRetryAfter
+		}
+		// Clamp before converting: seconds * time.Second overflows int64 into
+		// a negative duration for a large enough header.
+		if seconds > int(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
+		return time.Duration(seconds) * time.Second
 	}
-	// Clamp before converting: seconds * time.Second overflows int64 into a
-	// negative duration for a large enough header.
-	if seconds > int(maxRetryAfter/time.Second) {
-		return maxRetryAfter
+	if date, err := http.ParseTime(header); err == nil {
+		return clampWait(time.Until(date))
 	}
-	return time.Duration(seconds) * time.Second
+	return defaultRetryAfter
+}
+
+// clampWait keeps a wait inside [0, maxRetryAfter]; a date already in the past
+// means retry now, not never.
+func clampWait(d time.Duration) time.Duration {
+	return min(max(d, 0), maxRetryAfter)
 }
 
 // sleep waits for d unless ctx ends first.
@@ -235,25 +260,45 @@ func (e *APIError) Error() string {
 }
 
 // parseError reads Asana's {"errors":[{"message":...}]} body, and drains what
-// is left so the connection can be reused. A body that is missing or not JSON
-// still leaves a usable status.
+// is left so the connection can be reused.
 func parseError(resp *http.Response) *APIError {
 	apiErr := &APIError{Status: resp.StatusCode}
 
-	var body struct {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+	drain(resp.Body)
+	if err != nil {
+		return apiErr
+	}
+
+	var parsed struct {
 		Errors []struct {
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err == nil {
-		for _, e := range body.Errors {
-			apiErr.Messages = append(apiErr.Messages, e.Message)
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		// Not Asana's shape at all, so probably an HTML page from something in
+		// between. A snippet of it beats a bare status code.
+		if s := snippet(body); s != "" {
+			apiErr.Messages = []string{s}
 		}
+		return apiErr
 	}
-	drain(resp.Body)
+	for _, e := range parsed.Errors {
+		apiErr.Messages = append(apiErr.Messages, e.Message)
+	}
 	return apiErr
 }
 
+// snippet collapses a body to something that fits on one log line.
+func snippet(body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if len(s) > 200 {
+		s = s[:200] + "..."
+	}
+	return s
+}
+
 // drain empties the body so the connection returns to the idle pool instead of
-// being closed.
-func drain(r io.Reader) { _, _ = io.Copy(io.Discard, r) }
+// being closed. The cap keeps a server that never stops writing from stalling
+// us until the request timeout.
+func drain(r io.Reader) { _, _ = io.Copy(io.Discard, io.LimitReader(r, maxDrainBytes)) }

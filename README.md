@@ -59,10 +59,11 @@ rather than taken from the reference docs.
 
 ## Behaviour worth knowing
 
-**Rate limits.** Requests are paced by a token bucket at 150 per minute, the
-Asana free tier limit (`requestsPerMinute` in `internal/asana/client.go`; paid
-plans allow 1500). A burst of one spreads them evenly, so no 60 second window
-can exceed the limit even across a window boundary.
+**Rate limits.** Requests are paced by a token bucket at 145 per minute,
+just under the Asana free tier limit of 150 (`requestsPerMinute` in
+`internal/asana/client.go`; paid plans allow 1500). A burst of one spreads them
+evenly, and the margin is deliberate: pacing at exactly 150 puts a tick at both
+ends of a closed 60 second window, which allows 151 requests inside it.
 
 **Retries.** `429` waits exactly as long as `Retry-After` asks. `5xx`,
 transport failures and truncated bodies get a growing backoff, up to three

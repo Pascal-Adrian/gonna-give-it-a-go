@@ -20,20 +20,37 @@ import (
 
 // recorder captures the requests a handler receives.
 type recorder struct {
-	mu   sync.Mutex
-	seen []url.Values
+	mu      sync.Mutex
+	seen    []url.Values
+	headers []http.Header
 }
 
 func (rec *recorder) add(r *http.Request) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	rec.seen = append(rec.seen, r.URL.Query())
+	rec.headers = append(rec.headers, r.Header.Clone())
+}
+
+func (rec *recorder) header(i int, key string) string {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return rec.headers[i].Get(key)
 }
 
 func (rec *recorder) queries() []url.Values {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	return slices.Clone(rec.seen)
+}
+
+// fastBackoff shortens retry waits for the duration of a test, restoring
+// whatever the package actually declares rather than a second copy of it.
+func fastBackoff(t *testing.T) {
+	t.Helper()
+	previous := baseBackoff
+	baseBackoff = time.Millisecond
+	t.Cleanup(func() { baseBackoff = previous })
 }
 
 // newTestClient drops the rate limiter, which would otherwise pace every test
@@ -47,10 +64,8 @@ func newTestClient(srv *httptest.Server) *Client {
 
 func TestUsersRequestShape(t *testing.T) {
 	var rec recorder
-	var auth, accept string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec.add(r)
-		auth, accept = r.Header.Get("Authorization"), r.Header.Get("Accept")
 		io.WriteString(w, `{"data":[{"gid":"1","name":"Ada","email":"ada@example.com"}]}`)
 	}))
 	defer srv.Close()
@@ -66,11 +81,11 @@ func TestUsersRequestShape(t *testing.T) {
 	if users[0].GID != "1" || users[0].Email != "ada@example.com" {
 		t.Errorf("Users() = %+v", users)
 	}
-	if auth != "Bearer test-token" {
-		t.Errorf("Authorization = %q", auth)
+	if got := rec.header(0, "Authorization"); got != "Bearer test-token" {
+		t.Errorf("Authorization = %q", got)
 	}
-	if accept != "application/json" {
-		t.Errorf("Accept = %q", accept)
+	if got := rec.header(0, "Accept"); got != "application/json" {
+		t.Errorf("Accept = %q", got)
 	}
 
 	q := rec.queries()[0]
@@ -124,7 +139,7 @@ func TestProjectDecoding(t *testing.T) {
 			"gid":"77","name":"Roadmap",
 			"archived":false,"completed":false,
 			"completed_at":null,"created_at":"2026-01-02T03:04:05.000Z",
-			"due_on":"2026-06-30","notes":"ship it","public":true,
+			"due_on":"2026-06-30","start_on":null,"notes":"ship it","public":true,
 			"current_status":{"title":"On track","color":"green"},
 			"owner":{"gid":"5","name":"Ada"},
 			"members":[{"gid":"5","name":"Ada"},{"gid":"6","name":"Grace"}]
@@ -141,13 +156,21 @@ func TestProjectDecoding(t *testing.T) {
 		t.Fatalf("Projects() returned %d projects, want 1", len(projects))
 	}
 	p := projects[0]
-	if p.GID != "77" || p.Name != "Roadmap" || p.DueOn != "2026-06-30" {
+	if p.GID != "77" || p.Name != "Roadmap" {
 		t.Errorf("Projects()[0] = %+v", p)
 	}
+	if p.DueOn == nil || *p.DueOn != "2026-06-30" {
+		t.Errorf("DueOn = %v, want 2026-06-30", p.DueOn)
+	}
+	// A null in the response must stay null in the export, not become a zero
+	// value we invented.
 	if p.CompletedAt != nil {
 		t.Errorf("CompletedAt = %v, want nil", p.CompletedAt)
 	}
-	if want := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC); !p.CreatedAt.Equal(want) {
+	if p.StartOn != nil {
+		t.Errorf("StartOn = %v, want nil", *p.StartOn)
+	}
+	if want := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC); p.CreatedAt == nil || !p.CreatedAt.Equal(want) {
 		t.Errorf("CreatedAt = %v, want %v", p.CreatedAt, want)
 	}
 	if p.CurrentStatus == nil || p.CurrentStatus.Title != "On track" {
@@ -159,8 +182,7 @@ func TestProjectDecoding(t *testing.T) {
 }
 
 func TestRetries(t *testing.T) {
-	baseBackoff = time.Millisecond
-	t.Cleanup(func() { baseBackoff = time.Second })
+	fastBackoff(t)
 
 	tests := []struct {
 		name       string
@@ -243,8 +265,7 @@ func TestAPIErrorMessage(t *testing.T) {
 // A body that is malformed is the server's own bug and will not improve, but a
 // body that simply stops early is a read that may succeed next time.
 func TestDecodeFailures(t *testing.T) {
-	baseBackoff = time.Millisecond
-	t.Cleanup(func() { baseBackoff = time.Second })
+	fastBackoff(t)
 
 	tests := []struct {
 		name      string
@@ -277,6 +298,35 @@ func TestDecodeFailures(t *testing.T) {
 				t.Errorf("made %d requests, want %d", calls, tt.wantCalls)
 			}
 		})
+	}
+}
+
+// A server that alternates between two offsets never repeats consecutively,
+// so only a record of every offset seen catches it.
+func TestPaginationCycleIsDetected(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+
+		next := "a"
+		if r.URL.Query().Get("offset") == "a" {
+			next = "b"
+		}
+		io.WriteString(w, `{"data":[{"gid":"1"}],"next_page":{"offset":"`+next+`"}}`)
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(srv).Users(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "pagination stalled") {
+		t.Fatalf("Users() error = %v, want pagination stalled", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 3 {
+		t.Errorf("made %d requests, want 3", calls)
 	}
 }
 
@@ -335,6 +385,40 @@ func TestRetryAfterHeader(t *testing.T) {
 		if got := retryAfter(tt.header); got != tt.want {
 			t.Errorf("retryAfter(%q) = %v, want %v", tt.header, got, tt.want)
 		}
+	}
+}
+
+// Asana documents seconds, but anything sitting in front of it may answer with
+// the RFC 7231 date form instead.
+func TestRetryAfterHTTPDate(t *testing.T) {
+	future := time.Now().UTC().Add(20 * time.Second).Format(http.TimeFormat)
+	if got := retryAfter(future); got < 15*time.Second || got > 20*time.Second {
+		t.Errorf("retryAfter(%q) = %v, want about 20s", future, got)
+	}
+
+	past := time.Now().UTC().Add(-time.Hour).Format(http.TimeFormat)
+	if got := retryAfter(past); got != 0 {
+		t.Errorf("retryAfter(%q) = %v, want 0", past, got)
+	}
+
+	far := time.Now().UTC().Add(24 * time.Hour).Format(http.TimeFormat)
+	if got := retryAfter(far); got != maxRetryAfter {
+		t.Errorf("retryAfter(%q) = %v, want %v", far, got, maxRetryAfter)
+	}
+}
+
+// A proxy answering with HTML must not reduce to a bare status code.
+func TestNonAsanaErrorBodyIsQuoted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, "<html><body>\n  Maintenance in progress\n</body></html>")
+	}))
+	defer srv.Close()
+
+	fastBackoff(t)
+	_, err := newTestClient(srv).Users(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "Maintenance in progress") {
+		t.Fatalf("Users() error = %v, want the body quoted", err)
 	}
 }
 
