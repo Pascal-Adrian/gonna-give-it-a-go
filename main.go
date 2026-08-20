@@ -34,8 +34,15 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	log.Info("configuration loaded", "workspace", cfg.WorkspaceGID, "out_dir", cfg.OutDir)
+	log.Info("configuration loaded",
+		"workspace", cfg.WorkspaceGID,
+		"out_dir", cfg.OutDir,
+		"rate_limit", cfg.RateLimit,
+		"poll_users", cfg.PollUsers,
+		"poll_projects", cfg.PollProjects,
+	)
 
-	client := asana.New(cfg.Token, cfg.WorkspaceGID, log)
-	return extract.New(client, store.New(cfg.OutDir), log).Run(ctx)
+	client := asana.New(cfg.Token, cfg.WorkspaceGID, cfg.RateLimit, log)
+	svc := extract.New(client, store.New(cfg.OutDir), log)
+	return svc.Poll(ctx, cfg.PollUsers, cfg.PollProjects)
 }
