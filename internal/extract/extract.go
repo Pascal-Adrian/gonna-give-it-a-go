@@ -40,9 +40,14 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := extractCategory(ctx, s, "users", s.source.Users, func(u asana.User) string { return u.GID }); err != nil {
 		errs = append(errs, err)
 	}
-	// An interrupted run should stop rather than start the next category.
+	// An interrupted run stops rather than starting the next category. The
+	// cancellation is only added when nothing else failed: a fetch cut short
+	// already reports it, and repeating it reads like two separate failures.
 	if err := ctx.Err(); err != nil {
-		return errors.Join(append(errs, err)...)
+		if len(errs) == 0 {
+			return err
+		}
+		return errors.Join(errs...)
 	}
 	if err := extractCategory(ctx, s, "projects", s.source.Projects, func(p asana.Project) string { return p.GID }); err != nil {
 		errs = append(errs, err)
@@ -59,8 +64,11 @@ func extractCategory[T any](ctx context.Context, s *Service, category string, fe
 		return fmt.Errorf("fetching %s: %w", category, err)
 	}
 
-	for _, item := range items {
+	for n, item := range items {
 		if err := s.store.Save(category, id(item), item); err != nil {
+			// Say how much landed before giving up, so the count is never
+			// missing from the log when it matters most.
+			s.log.Info("saved category", "category", category, "count", n)
 			return fmt.Errorf("saving %s: %w", category, err)
 		}
 	}

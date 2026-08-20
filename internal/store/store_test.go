@@ -64,6 +64,47 @@ func TestSaveOverwrites(t *testing.T) {
 	}
 }
 
+// The export holds email addresses, so it must not be world readable.
+func TestSavePermissions(t *testing.T) {
+	root := t.TempDir()
+	if err := New(root).Save("users", "42", user{GID: "42"}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	dir, err := os.Stat(filepath.Join(root, "users"))
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := dir.Mode().Perm(); got != 0o700 {
+		t.Errorf("directory mode = %o, want 700", got)
+	}
+
+	file, err := os.Stat(filepath.Join(root, "users", "42.json"))
+	if err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+	if got := file.Mode().Perm(); got != 0o600 {
+		t.Errorf("file mode = %o, want 600", got)
+	}
+}
+
+// category is as caller supplied as id, so it gets the same guard.
+func TestSaveRejectsUnusableCategories(t *testing.T) {
+	for _, category := range []string{"", "../../etc", "a/b"} {
+		root := t.TempDir()
+		if err := New(root).Save(category, "42", user{}); err == nil {
+			t.Errorf("Save(category=%q) error = nil, want error", category)
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatalf("reading root: %v", err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("Save(category=%q) created %d entries, want none", category, len(entries))
+		}
+	}
+}
+
 func TestSaveRejectsUnusableIDs(t *testing.T) {
 	ids := []string{"", "a/b", `a\b`, "..", "../escape", "12..34"}
 
@@ -91,6 +132,11 @@ func TestSaveErrors(t *testing.T) {
 		}
 		if _, statErr := os.Stat(filepath.Join(root, "users", "42.json")); statErr == nil {
 			t.Error("a file was written despite the marshaling failure")
+		}
+		// Marshalling happens before any mkdir, so not even the directory
+		// should survive the failure.
+		if _, statErr := os.Stat(filepath.Join(root, "users")); statErr == nil {
+			t.Error("the category directory was created despite the marshaling failure")
 		}
 	})
 

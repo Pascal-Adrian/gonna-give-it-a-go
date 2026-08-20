@@ -22,28 +22,34 @@ func New(root string) *FileStore {
 // The write is not atomic: an interrupted run is meant to be re-run, not
 // resumed.
 func (s *FileStore) Save(category, id string, v any) error {
-	if !validID(id) {
+	if !validName(category) {
+		return fmt.Errorf("%q is not a usable category", category)
+	}
+	if !validName(id) {
 		return fmt.Errorf("%q is not a usable file name", id)
 	}
 
-	dir := filepath.Join(s.root, category)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("creating %s: %w", dir, err)
-	}
-
+	// Marshal before touching the filesystem, so a failure here leaves no
+	// empty directory behind.
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling %s/%s: %w", category, id, err)
 	}
 
+	dir := filepath.Join(s.root, category)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
+
+	// 0600: the export carries user email addresses.
 	path := filepath.Join(dir, id+".json")
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil
 }
 
-// validID keeps an id from escaping its category directory.
-func validID(id string) bool {
-	return id != "" && !strings.ContainsAny(id, `/\`) && !strings.Contains(id, "..")
+// validName keeps a path segment from escaping the directory it belongs in.
+func validName(name string) bool {
+	return name != "" && !strings.ContainsAny(name, `/\`) && !strings.Contains(name, "..")
 }

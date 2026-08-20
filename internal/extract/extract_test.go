@@ -3,6 +3,7 @@ package extract
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -134,5 +135,22 @@ func TestRunStopsWhenCancelled(t *testing.T) {
 	}
 	if _, ok := store.saved["projects"]; ok {
 		t.Error("projects were extracted after cancellation")
+	}
+}
+
+// A fetch cut short already reports the cancellation, so Run must not report
+// it a second time alongside.
+func TestRunDoesNotRepeatCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	source := fakeSource{usersErr: fmt.Errorf("fetching aborted: %w", context.Canceled)}
+	err := newService(source, &fakeStore{}).Run(ctx)
+
+	if err == nil {
+		t.Fatal("Run() error = nil, want the fetch error")
+	}
+	if got := strings.Count(err.Error(), "context canceled"); got != 1 {
+		t.Errorf("cancellation mentioned %d times in %q, want 1", got, err)
 	}
 }
