@@ -53,10 +53,18 @@ func fastBackoff(t *testing.T) {
 	t.Cleanup(func() { baseBackoff = previous })
 }
 
+// testRateLimit stands in for a plan's documented allowance.
+const testRateLimit = 150
+
+// gap is how long the limiter spaces requests for a given plan limit.
+func gap(limit int) time.Duration {
+	return time.Duration(float64(time.Second) / float64(pace(limit)))
+}
+
 // newTestClient drops the rate limiter, which would otherwise pace every test
 // at one request per 400ms.
 func newTestClient(srv *httptest.Server) *Client {
-	c := New("test-token", "9001", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := New("test-token", "9001", testRateLimit, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c.baseURL = srv.URL
 	c.limiter = rate.NewLimiter(rate.Inf, 1)
 	return c
@@ -434,10 +442,10 @@ func TestRateLimitPacing(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("test-token", "9001", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := New("test-token", "9001", testRateLimit, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c.baseURL = srv.URL
 
-	if want := rate.Every(time.Minute / requestsPerMinute); c.limiter.Limit() != want {
+	if want := pace(testRateLimit); c.limiter.Limit() != want {
 		t.Errorf("limit = %v, want %v", c.limiter.Limit(), want)
 	}
 	if got := c.limiter.Burst(); got != 1 {
@@ -449,7 +457,7 @@ func TestRateLimitPacing(t *testing.T) {
 		t.Fatalf("Users() error = %v", err)
 	}
 	// One token is available immediately; the second page waits for the next.
-	if elapsed, want := time.Since(start), time.Minute/requestsPerMinute; elapsed < want-50*time.Millisecond {
+	if elapsed, want := time.Since(start), gap(testRateLimit); elapsed < want-50*time.Millisecond {
 		t.Errorf("two requests took %v, want at least %v", elapsed, want)
 	}
 }
@@ -495,5 +503,42 @@ func TestConnectionIsReusedAcrossPages(t *testing.T) {
 	defer mu.Unlock()
 	if opened != 1 {
 		t.Errorf("opened %d connections for 3 pages, want 1", opened)
+	}
+}
+
+// The plan's limit is what the operator configures; the pace we issue at sits
+// just below it.
+func TestPaceLeavesHeadroom(t *testing.T) {
+	tests := []struct {
+		limit  int
+		perMin int
+	}{
+		{150, 145},   // free tier
+		{1500, 1455}, // paid tier
+		{60, 58},
+		{1, 1}, // never paces to zero
+		{0, 1}, // nor on nonsense
+	}
+
+	for _, tt := range tests {
+		want := rate.Every(time.Minute / time.Duration(tt.perMin))
+		if got := pace(tt.limit); got != want {
+			t.Errorf("pace(%d) = %v, want %v (%d/min)", tt.limit, got, want, tt.perMin)
+		}
+		if tt.limit > 0 && float64(pace(tt.limit)) > float64(tt.limit)/60 {
+			t.Errorf("pace(%d) = %v exceeds the plan limit", tt.limit, pace(tt.limit))
+		}
+	}
+}
+
+func TestNewUsesConfiguredLimit(t *testing.T) {
+	for _, limit := range []int{150, 1500} {
+		c := New("t", "9001", limit, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if got := c.limiter.Limit(); got != pace(limit) {
+			t.Errorf("New(limit=%d) limiter = %v, want %v", limit, got, pace(limit))
+		}
+		if got := c.limiter.Burst(); got != 1 {
+			t.Errorf("New(limit=%d) burst = %d, want 1", limit, got)
+		}
 	}
 }

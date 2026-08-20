@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type user struct {
@@ -18,7 +19,7 @@ func TestSave(t *testing.T) {
 	s := New(root)
 
 	want := user{GID: "42", Name: "Ada"}
-	if err := s.Save("users", want.GID, want); err != nil {
+	if _, err := s.Save("users", want.GID, want); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 
@@ -44,10 +45,10 @@ func TestSaveOverwrites(t *testing.T) {
 	s := New(root)
 	path := filepath.Join(root, "users", "42.json")
 
-	if err := s.Save("users", "42", user{GID: "42", Name: strings.Repeat("long", 100)}); err != nil {
+	if _, err := s.Save("users", "42", user{GID: "42", Name: strings.Repeat("long", 100)}); err != nil {
 		t.Fatalf("first Save() error = %v", err)
 	}
-	if err := s.Save("users", "42", user{GID: "42", Name: "Ada"}); err != nil {
+	if _, err := s.Save("users", "42", user{GID: "42", Name: "Ada"}); err != nil {
 		t.Fatalf("second Save() error = %v", err)
 	}
 
@@ -67,7 +68,7 @@ func TestSaveOverwrites(t *testing.T) {
 // The export holds email addresses, so it must not be world readable.
 func TestSavePermissions(t *testing.T) {
 	root := t.TempDir()
-	if err := New(root).Save("users", "42", user{GID: "42"}); err != nil {
+	if _, err := New(root).Save("users", "42", user{GID: "42"}); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 
@@ -92,7 +93,7 @@ func TestSavePermissions(t *testing.T) {
 func TestSaveRejectsUnusableCategories(t *testing.T) {
 	for _, category := range []string{"", "../../etc", "a/b"} {
 		root := t.TempDir()
-		if err := New(root).Save(category, "42", user{}); err == nil {
+		if _, err := New(root).Save(category, "42", user{}); err == nil {
 			t.Errorf("Save(category=%q) error = nil, want error", category)
 		}
 		entries, err := os.ReadDir(root)
@@ -110,7 +111,7 @@ func TestSaveRejectsUnusableIDs(t *testing.T) {
 
 	for _, id := range ids {
 		root := t.TempDir()
-		if err := New(root).Save("users", id, user{}); err == nil {
+		if _, err := New(root).Save("users", id, user{}); err == nil {
 			t.Errorf("Save(%q) error = nil, want error", id)
 		}
 		entries, err := os.ReadDir(root)
@@ -126,7 +127,7 @@ func TestSaveRejectsUnusableIDs(t *testing.T) {
 func TestSaveErrors(t *testing.T) {
 	t.Run("unmarshalable value", func(t *testing.T) {
 		root := t.TempDir()
-		err := New(root).Save("users", "42", make(chan int))
+		_, err := New(root).Save("users", "42", make(chan int))
 		if err == nil || !strings.Contains(err.Error(), "marshaling") {
 			t.Fatalf("Save() error = %v, want a marshaling error", err)
 		}
@@ -147,9 +148,55 @@ func TestSaveErrors(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(root, "users"), []byte("in the way"), 0o644); err != nil {
 			t.Fatalf("setup: %v", err)
 		}
-		err := New(root).Save("users", "42", user{})
+		_, err := New(root).Save("users", "42", user{})
 		if err == nil || !strings.Contains(err.Error(), "creating") {
 			t.Fatalf("Save() error = %v, want a directory creation error", err)
 		}
 	})
+}
+
+// Re-saving identical content must not touch the file: an unchanged mtime is
+// what makes the directory meaningful to anything watching it.
+func TestSaveSkipsUnchangedContent(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	path := filepath.Join(root, "users", "42.json")
+
+	written, err := s.Save("users", "42", user{GID: "42", Name: "Ada"})
+	if err != nil {
+		t.Fatalf("first Save() error = %v", err)
+	}
+	if !written {
+		t.Error("first Save() written = false, want true")
+	}
+
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	written, err = s.Save("users", "42", user{GID: "42", Name: "Ada"})
+	if err != nil {
+		t.Fatalf("second Save() error = %v", err)
+	}
+	if written {
+		t.Error("second Save() written = true, want false for identical content")
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("mtime moved from %v to %v for unchanged content", before.ModTime(), after.ModTime())
+	}
+
+	written, err = s.Save("users", "42", user{GID: "42", Name: "Grace"})
+	if err != nil {
+		t.Fatalf("third Save() error = %v", err)
+	}
+	if !written {
+		t.Error("third Save() written = false, want true for changed content")
+	}
 }
