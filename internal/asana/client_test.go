@@ -3,8 +3,10 @@ package asana
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -509,24 +511,16 @@ func TestConnectionIsReusedAcrossPages(t *testing.T) {
 // The plan's limit is what the operator configures; the pace we issue at sits
 // just below it.
 func TestPaceLeavesHeadroom(t *testing.T) {
-	tests := []struct {
-		limit  int
-		perMin int
-	}{
-		{150, 145},   // free tier
-		{1500, 1455}, // paid tier
-		{60, 58},
-		{1, 1}, // never paces to zero
-		{0, 1}, // nor on nonsense
-	}
+	for _, limit := range []int{60, 150, 1500, 10000} {
+		got := float64(pace(limit))
+		allowed := float64(limit) / 60
 
-	for _, tt := range tests {
-		want := rate.Every(time.Minute / time.Duration(tt.perMin))
-		if got := pace(tt.limit); got != want {
-			t.Errorf("pace(%d) = %v, want %v (%d/min)", tt.limit, got, want, tt.perMin)
+		if got >= allowed {
+			t.Errorf("pace(%d) = %v/s, which does not sit below the limit of %v/s", limit, got, allowed)
 		}
-		if tt.limit > 0 && float64(pace(tt.limit)) > float64(tt.limit)/60 {
-			t.Errorf("pace(%d) = %v exceeds the plan limit", tt.limit, pace(tt.limit))
+		// Close enough to the limit to be worth having: within 5%.
+		if got < allowed*0.95 {
+			t.Errorf("pace(%d) = %v/s, further below %v/s than intended", limit, got, allowed)
 		}
 	}
 }
@@ -540,5 +534,69 @@ func TestNewUsesConfiguredLimit(t *testing.T) {
 		if got := c.limiter.Burst(); got != 1 {
 			t.Errorf("New(limit=%d) burst = %d, want 1", limit, got)
 		}
+	}
+}
+
+// A limit large enough to truncate an integer interval to zero used to yield
+// rate.Inf, silently switching pacing off.
+func TestPaceNeverGoesInfinite(t *testing.T) {
+	for _, limit := range []int{60_000_000_000, 1217672920327825, math.MaxInt32} {
+		if got := pace(limit); math.IsInf(float64(got), 1) {
+			t.Errorf("pace(%d) = %v, want a finite rate", limit, got)
+		}
+	}
+	if got := pace(0); got != 0 {
+		t.Errorf("pace(0) = %v, want 0", got)
+	}
+}
+
+func TestFatal(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{&APIError{Status: http.StatusUnauthorized}, true},
+		{&APIError{Status: http.StatusForbidden}, true},
+		{fmt.Errorf("wrapped: %w", &APIError{Status: http.StatusUnauthorized}), true},
+		{&APIError{Status: http.StatusInternalServerError}, false},
+		{&APIError{Status: http.StatusTooManyRequests}, false},
+		{errors.New("plain"), false},
+		{nil, false},
+	}
+
+	for _, tt := range tests {
+		if got := Fatal(tt.err); got != tt.want {
+			t.Errorf("Fatal(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
+// Asana does not promise a stable order for these arrays, and an order change
+// would otherwise look like a content change and rewrite the file.
+func TestProjectMembersAreSorted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"gid":"77",
+			"members":[{"gid":"30"},{"gid":"10"},{"gid":"20"}],
+			"followers":[{"gid":"9"},{"gid":"5"}]}]}`)
+	}))
+	defer srv.Close()
+
+	projects, err := newTestClient(srv).Projects(t.Context())
+	if err != nil {
+		t.Fatalf("Projects() error = %v", err)
+	}
+
+	gids := func(refs []Ref) []string {
+		out := make([]string, len(refs))
+		for i, r := range refs {
+			out[i] = r.GID
+		}
+		return out
+	}
+	if got := gids(projects[0].Members); !slices.Equal(got, []string{"10", "20", "30"}) {
+		t.Errorf("members = %v, want sorted", got)
+	}
+	if got := gids(projects[0].Followers); !slices.Equal(got, []string{"5", "9"}) {
+		t.Errorf("followers = %v, want sorted", got)
 	}
 }

@@ -21,6 +21,7 @@ Fill in the two required variables:
 | `ASANA_POLL_PROJECTS` | no | `30s` | How often projects are re-read |
 | `ASANA_POLL_USERS` | no | `5m` | How often users are re-read |
 | `ASANA_RATE_LIMIT` | no | `150` | Requests per minute your plan allows |
+| `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn` or `error` |
 
 Real environment variables take precedence over `.env`, and `.env` is never
 loaded into the process environment, so the token stays out of any child
@@ -40,13 +41,21 @@ level=INFO msg="saved category" category=projects changed=0 unchanged=2
 ```
 
 It keeps running, re-reading projects every 30s and users every 5m, until
-interrupted. Ctrl-C stops it cleanly.
+interrupted. Ctrl-C stops it cleanly. Every poll is logged, including the ones
+that found nothing new, so an idle poller is visibly alive rather than merely
+silent; raise `LOG_LEVEL` above `info` to quieten it.
 
 Each category polls on its own schedule, in its own goroutine. That is what
-keeps them independent: neither can delay or fail the other. It is not a speed
-optimisation on the free tier, where the rate limiter rather than the network
-sets the pace -- but on a paid plan, with `ASANA_RATE_LIMIT` raised, the same
-code roughly halves a full sweep.
+keeps them independent: neither can delay or fail the other.
+
+It is not a speed optimisation on the free tier. Pages within a category are
+chained -- each one needs the previous page's offset -- so a category issues at
+most one request per round trip, about 3 per second. Two categories together
+demand roughly 6. At 150 requests per minute the bucket only allows 2.4 per
+second, so it, not the network, sets the pace and running them at once saves
+nothing. Above roughly 400 requests per minute the bucket stops binding and the
+same code halves a full sweep; on a paid plan at 1500 it allows 24 per second,
+far more than the categories can ask for.
 
 A file is only rewritten when its content actually changed, so modification
 times stay meaningful for anything watching the directory.
@@ -88,10 +97,17 @@ transport failures and truncated bodies get a growing backoff, up to three
 attempts. Malformed JSON, type mismatches and other `4xx` are final. A `401`
 says to check `ASANA_TOKEN`; a `402` means a requested field needs a paid plan.
 
-**Partial failure.** A category that fails does not stop the other, so a broken
-projects fetch still leaves the users on disk. Both failures are reported
-together and the exit status is still non-zero — read the counts to see what
-landed. Ctrl-C stops the run rather than starting the next category.
+**Failure.** A poll that fails is logged and retried on the next tick, so a
+transient 500 or a dropped connection does not end the process. The two
+categories are separate goroutines, so a projects fetch that keeps failing
+never delays or stops the users poll.
+
+A credential that stops working is different: a `401` or `403` cannot be
+retried into working, so it ends the run and exits non-zero rather than
+logging forever while producing nothing.
+
+Within a category, a save failure ends that poll — the causes are systemic, a
+full disk or bad permissions — and the count of what landed first is logged.
 
 ## Layout
 

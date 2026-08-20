@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,7 @@ import (
 // envKeys are cleared before every case so real credentials cannot leak in.
 var envKeys = []string{
 	"ASANA_TOKEN", "ASANA_WORKSPACE_ID", "ASANA_OUT_DIR",
-	"ASANA_POLL_USERS", "ASANA_POLL_PROJECTS", "ASANA_RATE_LIMIT",
+	"ASANA_POLL_USERS", "ASANA_POLL_PROJECTS", "ASANA_RATE_LIMIT", "LOG_LEVEL",
 }
 
 func TestLoad(t *testing.T) {
@@ -64,17 +65,48 @@ func TestLoad(t *testing.T) {
 			want: Config{
 				Token: "tok", WorkspaceGID: "123", OutDir: "out",
 				PollUsers: 2 * time.Minute, PollProjects: 15 * time.Second, RateLimit: 1500,
+				LogLevel: slog.LevelInfo,
 			},
 		},
 		{
 			name:    "a zero interval is rejected",
 			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_POLL_PROJECTS": "0s"},
-			wantErr: []string{"ASANA_POLL_PROJECTS", "more than zero"},
+			wantErr: []string{"ASANA_POLL_PROJECTS", "too short"},
 		},
 		{
 			name:    "a negative interval is rejected",
 			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_POLL_USERS": "-5m"},
-			wantErr: []string{"ASANA_POLL_USERS", "more than zero"},
+			wantErr: []string{"ASANA_POLL_USERS", "too short"},
+		},
+		{
+			// Not zero, but still fast enough to spend the whole rate budget
+			// re-reading data that cannot have changed.
+			name:    "a sub second interval is rejected",
+			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_POLL_PROJECTS": "1ms"},
+			wantErr: []string{"ASANA_POLL_PROJECTS", "too short"},
+		},
+		{
+			// ASANA_RATE_LIMIT sits right below ASANA_WORKSPACE_ID in
+			// .env.example, and a gid pasted here used to disable pacing.
+			name:    "a pasted gid is not a rate limit",
+			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_RATE_LIMIT": "1217672920327825"},
+			wantErr: []string{"ASANA_RATE_LIMIT", "implausible"},
+		},
+		{
+			name: "log level from the environment",
+			env: map[string]string{
+				"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "LOG_LEVEL": "debug",
+			},
+			want: Config{
+				Token: "tok", WorkspaceGID: "123", OutDir: "out",
+				PollUsers: defaultPollUsers, PollProjects: defaultPollProjects,
+				RateLimit: defaultRateLimit, LogLevel: slog.LevelDebug,
+			},
+		},
+		{
+			name:    "an unknown log level is rejected",
+			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "LOG_LEVEL": "chatty"},
+			wantErr: []string{"LOG_LEVEL", "not a level"},
 		},
 		{
 			name:    "an unparseable interval is rejected",

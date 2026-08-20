@@ -1,5 +1,6 @@
-// Command gonna-give-it-a-go extracts the users and projects of an Asana
-// workspace and writes them to disk as one JSON file per object.
+// Command gonna-give-it-a-go mirrors the users and projects of an Asana
+// workspace into a directory, one JSON file per object, re-reading each
+// category on its own interval until interrupted.
 package main
 
 import (
@@ -17,16 +18,15 @@ import (
 )
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(log); err != nil {
-		// Printed, not logged: slog would escape the newlines between joined
-		// errors into one unreadable line.
+	if err := run(); err != nil {
+		// Printed, not logged: this runs before the logger exists, and slog
+		// would escape the newlines between joined errors anyway.
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(log *slog.Logger) error {
+func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -34,6 +34,8 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	log.Info("configuration loaded",
 		"workspace", cfg.WorkspaceGID,
 		"out_dir", cfg.OutDir,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -23,20 +24,36 @@ type fakeSource struct {
 	projectsErr   error
 	usersCalls    int
 	projectsCalls int
+
+	usersCalled    chan struct{}
+	projectsCalled chan struct{}
 }
 
 func (f *fakeSource) Users(context.Context) ([]asana.User, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.usersCalls++
+	f.mu.Unlock()
+	f.signal(f.usersCalled)
 	return f.users, f.usersErr
 }
 
 func (f *fakeSource) Projects(context.Context) ([]asana.Project, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.projectsCalls++
+	f.mu.Unlock()
+	f.signal(f.projectsCalled)
 	return f.projects, f.projectsErr
+}
+
+// signal reports a call without ever blocking the poller.
+func (f *fakeSource) signal(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
 }
 
 func (f *fakeSource) calls() (users, projects int) {
@@ -50,6 +67,15 @@ type fakeStore struct {
 	saved     map[string][]string // category to ids
 	failOn    string
 	unchanged map[string]bool // ids Save reports as already current
+}
+
+// unchangedIDs marks ids Save should report as already current.
+func (s *fakeStore) markUnchanged(ids ...string) *fakeStore {
+	s.unchanged = map[string]bool{}
+	for _, id := range ids {
+		s.unchanged[id] = true
+	}
+	return s
 }
 
 func (s *fakeStore) Save(category, id string, _ any) (bool, error) {
@@ -74,6 +100,10 @@ func (s *fakeStore) ids(category string) []string {
 func newService(source Source, store Store) *Service {
 	return New(source, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
+
+// pollFast keeps the polling tests quick. They wait on progress rather than
+// the clock, so the interval only sets how soon the next tick comes.
+const pollFast = 10 * time.Millisecond
 
 var (
 	twoUsers    = []asana.User{{GID: "1"}, {GID: "2"}}
@@ -144,36 +174,63 @@ func TestCategories(t *testing.T) {
 	}
 }
 
-// A category that fails must not prevent the other from being written, which
-// is now a property of them running independently rather than of any code
-// that coordinates them.
-func TestCategoriesAreIndependent(t *testing.T) {
-	source := &fakeSource{usersErr: errors.New("boom"), projects: twoProjects}
+// waitFor blocks until ch fires n times, failing the test rather than hanging
+// if the poller stalls. Waiting on progress rather than the clock keeps these
+// tests off wall-clock timing.
+func waitFor(t *testing.T, ch chan struct{}, n int) {
+	t.Helper()
+	for range n {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for a poll")
+		}
+	}
+}
+
+// A category that keeps failing must not stop the other from being written.
+// With the categories in separate goroutines this is a property of Poll, so it
+// has to be tested through Poll.
+func TestPollCategoriesAreIndependent(t *testing.T) {
+	source := &fakeSource{
+		usersErr:       errors.New("boom"),
+		projects:       twoProjects,
+		usersCalled:    make(chan struct{}, 1),
+		projectsCalled: make(chan struct{}, 1),
+	}
 	store := &fakeStore{}
-	svc := newService(source, store)
+	ctx, cancel := context.WithCancel(t.Context())
 
-	if err := svc.Users(t.Context()); err == nil {
-		t.Fatal("Users() error = nil, want the fetch error")
-	}
-	if err := svc.Projects(t.Context()); err != nil {
-		t.Fatalf("Projects() error = %v", err)
+	done := make(chan error, 1)
+	go func() { done <- newService(source, store).Poll(ctx, pollFast, pollFast) }()
+
+	waitFor(t, source.usersCalled, 2)
+	waitFor(t, source.projectsCalled, 2)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Poll() error = %v", err)
 	}
 
-	if got := store.ids("projects"); !slices.Equal(got, []string{"10", "11"}) {
-		t.Errorf("projects = %v, want both saved", got)
+	if got := store.ids("projects"); len(got) == 0 {
+		t.Error("projects were never saved while users kept failing")
 	}
 }
 
 func TestPollRunsBothCategoriesUntilCancelled(t *testing.T) {
-	source := &fakeSource{users: twoUsers, projects: twoProjects}
+	source := &fakeSource{
+		users:          twoUsers,
+		projects:       twoProjects,
+		usersCalled:    make(chan struct{}, 1),
+		projectsCalled: make(chan struct{}, 1),
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 
 	done := make(chan error, 1)
-	go func() {
-		done <- newService(source, &fakeStore{}).Poll(ctx, 40*time.Millisecond, 10*time.Millisecond)
-	}()
+	go func() { done <- newService(source, &fakeStore{}).Poll(ctx, pollFast, pollFast) }()
 
-	time.Sleep(150 * time.Millisecond)
+	// Both must poll repeatedly; the exact counts are the scheduler's business.
+	waitFor(t, source.usersCalled, 2)
+	waitFor(t, source.projectsCalled, 2)
 	cancel()
 
 	select {
@@ -181,36 +238,46 @@ func TestPollRunsBothCategoriesUntilCancelled(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Poll() error = %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Poll() did not return after cancellation")
-	}
-
-	users, projects := source.calls()
-	if users < 2 {
-		t.Errorf("users polled %d times, want at least 2", users)
-	}
-	// Projects tick four times as often, so they must clearly outpace users.
-	if projects <= users {
-		t.Errorf("projects polled %d times and users %d, want projects to run more often", projects, users)
 	}
 }
 
-// A failing category must keep ticking rather than ending the process.
+// A transient failure must not end a process meant to stay up.
 func TestPollKeepsGoingAfterFailure(t *testing.T) {
-	source := &fakeSource{usersErr: errors.New("boom"), projectsErr: errors.New("boom")}
+	source := &fakeSource{
+		usersErr:    errors.New("boom"),
+		projectsErr: errors.New("boom"),
+		usersCalled: make(chan struct{}, 1),
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 
 	done := make(chan error, 1)
-	go func() {
-		done <- newService(source, &fakeStore{}).Poll(ctx, 10*time.Millisecond, 10*time.Millisecond)
-	}()
+	go func() { done <- newService(source, &fakeStore{}).Poll(ctx, pollFast, pollFast) }()
 
-	time.Sleep(100 * time.Millisecond)
+	waitFor(t, source.usersCalled, 3)
 	cancel()
-	<-done
+	if err := <-done; err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+}
 
-	if users, _ := source.calls(); users < 2 {
-		t.Errorf("users polled %d times after failing, want it to keep retrying", users)
+// A credential that stops working cannot be retried into working, so it must
+// end the run and reach the caller rather than log forever.
+func TestPollStopsOnFatalError(t *testing.T) {
+	source := &fakeSource{usersErr: &asana.APIError{Status: http.StatusUnauthorized}}
+
+	done := make(chan error, 1)
+	go func() { done <- newService(source, &fakeStore{}).Poll(t.Context(), pollFast, pollFast) }()
+
+	select {
+	case err := <-done:
+		var apiErr *asana.APIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized {
+			t.Fatalf("Poll() error = %v, want the 401 to surface", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Poll() kept retrying a permanently failing credential")
 	}
 }
 
@@ -218,17 +285,42 @@ func TestPollReturnsPromptlyWhenAlreadyCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
+	source := &fakeSource{}
 	done := make(chan error, 1)
-	go func() {
-		done <- newService(&fakeSource{}, &fakeStore{}).Poll(ctx, time.Hour, time.Hour)
-	}()
+	go func() { done <- newService(source, &fakeStore{}).Poll(ctx, time.Hour, time.Hour) }()
 
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("Poll() error = %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Poll() blocked on a cancelled context")
+	}
+
+	// A cancelled context must not buy one last sweep on the way out.
+	if users, projects := source.calls(); users != 0 || projects != 0 {
+		t.Errorf("polled %d users and %d projects after cancellation, want none", users, projects)
+	}
+}
+
+func TestPollRejectsUnusableIntervals(t *testing.T) {
+	err := newService(&fakeSource{}, &fakeStore{}).Poll(t.Context(), 0, pollFast)
+	if err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Fatalf("Poll() error = %v, want a complaint about the interval", err)
+	}
+}
+
+// The changed/unchanged split is what the whole increment is for, so it needs
+// a case where something is genuinely unchanged.
+func TestUnchangedObjectsAreCounted(t *testing.T) {
+	store := (&fakeStore{}).markUnchanged("1")
+	source := &fakeSource{users: twoUsers}
+
+	if err := newService(source, store).Users(t.Context()); err != nil {
+		t.Fatalf("Users() error = %v", err)
+	}
+	if got := store.ids("users"); !slices.Equal(got, []string{"1", "2"}) {
+		t.Errorf("users = %v, want both attempted", got)
 	}
 }

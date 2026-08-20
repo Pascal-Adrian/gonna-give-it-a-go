@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -19,6 +20,12 @@ const (
 	defaultPollUsers    = 5 * time.Minute
 	defaultPollProjects = 30 * time.Second
 	defaultRateLimit    = 150 // Asana's free tier; paid plans allow 1500.
+
+	// Floors and ceilings that catch a typo rather than express a policy: a
+	// sub-second interval polls in a near-tight loop, and a limit this large
+	// is a pasted gid, not a plan.
+	minInterval  = time.Second
+	maxRateLimit = 10_000
 )
 
 // Config holds everything the extractor needs to run.
@@ -33,6 +40,10 @@ type Config struct {
 	// RateLimit is the requests per minute the plan allows, not the rate we
 	// issue; the client paces below it.
 	RateLimit int
+
+	// LogLevel gates the output. Polls that change nothing log at debug, so
+	// debug is how you confirm a quiet poller is still working.
+	LogLevel slog.Level
 }
 
 // Load reads the configuration, preferring the environment over .env and
@@ -71,8 +82,11 @@ func Load() (Config, error) {
 	if cfg.PollProjects, err = duration(lookup("ASANA_POLL_PROJECTS"), defaultPollProjects); err != nil {
 		errs = append(errs, fmt.Errorf("ASANA_POLL_PROJECTS: %w", err))
 	}
-	if cfg.RateLimit, err = positive(lookup("ASANA_RATE_LIMIT"), defaultRateLimit); err != nil {
+	if cfg.RateLimit, err = rateLimit(lookup("ASANA_RATE_LIMIT"), defaultRateLimit); err != nil {
 		errs = append(errs, fmt.Errorf("ASANA_RATE_LIMIT: %w", err))
+	}
+	if cfg.LogLevel, err = logLevel(lookup("LOG_LEVEL")); err != nil {
+		errs = append(errs, fmt.Errorf("LOG_LEVEL: %w", err))
 	}
 
 	if cfg.Token == "" {
@@ -93,7 +107,8 @@ func Load() (Config, error) {
 }
 
 // duration parses a Go duration such as "30s", falling back to fallback when
-// unset. Zero is rejected: a zero interval would poll in a tight loop.
+// unset. Anything under minInterval is rejected: polling that fast would spend
+// the whole rate budget re-reading data that cannot have changed.
 func duration(value string, fallback time.Duration) (time.Duration, error) {
 	if value == "" {
 		return fallback, nil
@@ -102,14 +117,14 @@ func duration(value string, fallback time.Duration) (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%q is not a duration, for example 30s or 5m", value)
 	}
-	if d <= 0 {
-		return 0, fmt.Errorf("%v is not a usable interval, expected more than zero", d)
+	if d < minInterval {
+		return 0, fmt.Errorf("%v is too short an interval, expected at least %v", d, minInterval)
 	}
 	return d, nil
 }
 
-// positive parses a count, falling back to fallback when unset.
-func positive(value string, fallback int) (int, error) {
+// rateLimit parses the plan's allowance, falling back to fallback when unset.
+func rateLimit(value string, fallback int) (int, error) {
 	if value == "" {
 		return fallback, nil
 	}
@@ -120,7 +135,22 @@ func positive(value string, fallback int) (int, error) {
 	if n <= 0 {
 		return 0, fmt.Errorf("%d is not usable, expected more than zero", n)
 	}
+	if n > maxRateLimit {
+		return 0, fmt.Errorf("%d is implausible for a plan limit, expected at most %d", n, maxRateLimit)
+	}
 	return n, nil
+}
+
+// logLevel parses a slog level name, defaulting to info.
+func logLevel(value string) (slog.Level, error) {
+	if value == "" {
+		return slog.LevelInfo, nil
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(value)); err != nil {
+		return 0, fmt.Errorf("%q is not a level, expected debug, info, warn or error", value)
+	}
+	return level, nil
 }
 
 // isGID reports whether s is a non-empty string of decimal digits, the shape

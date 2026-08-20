@@ -2,6 +2,7 @@
 package asana
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +25,7 @@ const (
 	// Percentage of the plan's limit we actually pace at. Running at exactly
 	// the limit puts ticks at both ends of a closed 60 second window, which
 	// permits one request more than allowed.
-	paceHeadroom = 97
+	paceHeadroom = 97.0
 
 	pageSize       = 100 // Asana's maximum.
 	maxAttempts    = 3
@@ -70,8 +72,21 @@ func (c *Client) Users(ctx context.Context) ([]User, error) {
 
 // Projects returns every project in the workspace, archived ones included.
 func (c *Client) Projects(ctx context.Context) ([]Project, error) {
-	return fetchAll[Project](ctx, c, "/projects", url.Values{"opt_fields": {projectFields}})
+	projects, err := fetchAll[Project](ctx, c, "/projects", url.Values{"opt_fields": {projectFields}})
+	if err != nil {
+		return nil, err
+	}
+
+	// Asana does not promise a stable order for these, and a reshuffle would
+	// otherwise read as a content change and rewrite the file for nothing.
+	for i := range projects {
+		slices.SortFunc(projects[i].Members, byGID)
+		slices.SortFunc(projects[i].Followers, byGID)
+	}
+	return projects, nil
 }
+
+func byGID(a, b Ref) int { return cmp.Compare(a.GID, b.GID) }
 
 // page is the envelope Asana wraps every list response in.
 type page[T any] struct {
@@ -191,12 +206,13 @@ var baseBackoff = time.Second
 
 // pace converts a plan's requests-per-minute allowance into the rate we issue
 // at, keeping a little back so a burst boundary cannot tip us over.
+//
+// The arithmetic is float, not a time.Minute division: that truncates to a
+// zero interval for a large enough allowance, and rate.Every(0) is rate.Inf,
+// which silently switches rate limiting off altogether.
 func pace(requestsPerMinute int) rate.Limit {
-	if requestsPerMinute < 1 {
-		requestsPerMinute = 1
-	}
-	perMinute := max(requestsPerMinute*paceHeadroom/100, 1)
-	return rate.Every(time.Minute / time.Duration(perMinute))
+	perSecond := float64(requestsPerMinute) * paceHeadroom / 100 / 60
+	return rate.Limit(max(perSecond, 0))
 }
 
 // backoff grows 1s, 2s, 4s across attempts.
@@ -248,6 +264,17 @@ func sleep(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// Fatal reports whether err is one that retrying cannot fix. A rejected or
+// unpermitted credential stays rejected, so a caller that would otherwise
+// retry forever should stop instead.
+func Fatal(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden
 }
 
 // APIError is a non-2xx response from Asana.

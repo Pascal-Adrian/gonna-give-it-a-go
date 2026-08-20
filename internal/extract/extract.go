@@ -1,9 +1,11 @@
-// Package extract keeps a directory in step with an Asana workspace, polling
-// each category on its own interval.
+// Package extract mirrors an Asana workspace into a directory, polling each
+// category on its own interval. Objects deleted in Asana keep their files:
+// nothing here removes what it did not just fetch.
 package extract
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -44,10 +46,20 @@ func (s *Service) Projects(ctx context.Context) error {
 	return extractCategory(ctx, s, "projects", s.source.Projects, func(p asana.Project) string { return p.GID })
 }
 
-// Poll keeps both categories current until ctx ends. Each runs on its own
-// schedule, which is also what isolates them: neither can delay or fail the
-// other.
+// Poll keeps both categories current until ctx ends, or until one of them
+// fails in a way that retrying cannot fix. Each runs on its own schedule,
+// which is also what isolates them: neither can delay or fail the other.
 func (s *Service) Poll(ctx context.Context, usersEvery, projectsEvery time.Duration) error {
+	if usersEvery <= 0 || projectsEvery <= 0 {
+		return fmt.Errorf("poll intervals must be positive, got users %v and projects %v", usersEvery, projectsEvery)
+	}
+
+	// A credential that stops working stops both categories, so the first
+	// fatal error ends the run rather than being retried until the process is
+	// killed.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	categories := []struct {
 		every time.Duration
 		run   func(context.Context) error
@@ -56,30 +68,52 @@ func (s *Service) Poll(ctx context.Context, usersEvery, projectsEvery time.Durat
 		{projectsEvery, s.Projects},
 	}
 
-	var wg sync.WaitGroup
+	var (
+		mu   sync.Mutex
+		errs []error
+		wg   sync.WaitGroup
+	)
 	for _, c := range categories {
-		wg.Go(func() { s.repeat(ctx, c.every, c.run) })
+		wg.Go(func() {
+			if err := s.repeat(ctx, c.every, c.run); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+				cancel()
+			}
+		})
 	}
 	wg.Wait()
-	return nil
+	return errors.Join(errs...)
 }
 
-// repeat runs now, then on every tick, until ctx ends. A failure is logged and
-// left for the next tick: a transient error should not end a process meant to
-// stay up.
-func (s *Service) repeat(ctx context.Context, every time.Duration, run func(context.Context) error) {
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-
+// repeat runs now, then once per interval, until ctx ends. A failure is logged
+// and left for the next run: a transient error should not end a process meant
+// to stay up. One that retrying cannot fix is returned instead.
+//
+// The wait starts when a run finishes rather than when it began, so a run that
+// overtakes its own interval cannot queue the next one back to back.
+func (s *Service) repeat(ctx context.Context, every time.Duration, run func(context.Context) error) error {
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		started := time.Now()
 		if err := run(ctx); err != nil && ctx.Err() == nil {
+			if asana.Fatal(err) {
+				return err
+			}
 			s.log.Error("poll failed", "err", err, "retry_in", every)
+		}
+		if took := time.Since(started); took > every {
+			s.log.Warn("poll is falling behind its interval", "took", took, "interval", every)
 		}
 
 		select {
 		case <-ctx.Done():
-			return
-		case <-ticker.C:
+			return nil
+		case <-time.After(every):
 		}
 	}
 }
@@ -108,6 +142,9 @@ func extractCategory[T any](ctx context.Context, s *Service, category string, fe
 		}
 	}
 
+	// Every poll is logged, including the ones that changed nothing: a silent
+	// idle poller is indistinguishable from a wedged one. Set LOG_LEVEL above
+	// info to quieten it.
 	s.log.Info("saved category", "category", category, "changed", changed, "unchanged", len(items)-changed)
 	return nil
 }
