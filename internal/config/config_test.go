@@ -5,10 +5,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // envKeys are cleared before every case so real credentials cannot leak in.
-var envKeys = []string{"ASANA_TOKEN", "ASANA_WORKSPACE_ID", "ASANA_OUT_DIR"}
+var envKeys = []string{
+	"ASANA_TOKEN", "ASANA_WORKSPACE_ID", "ASANA_OUT_DIR",
+	"ASANA_POLL_USERS", "ASANA_POLL_PROJECTS", "ASANA_RATE_LIMIT",
+}
 
 func TestLoad(t *testing.T) {
 	tests := []struct {
@@ -21,35 +25,76 @@ func TestLoad(t *testing.T) {
 		{
 			name: "values from environment",
 			env:  map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123"},
-			want: Config{Token: "tok", WorkspaceGID: "123", OutDir: "out"},
+			want: Config{Token: "tok", WorkspaceGID: "123", OutDir: "out", PollUsers: defaultPollUsers, PollProjects: defaultPollProjects, RateLimit: defaultRateLimit},
 		},
 		{
 			name: "out dir override",
 			env:  map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_OUT_DIR": "export"},
-			want: Config{Token: "tok", WorkspaceGID: "123", OutDir: "export"},
+			want: Config{Token: "tok", WorkspaceGID: "123", OutDir: "export", PollUsers: defaultPollUsers, PollProjects: defaultPollProjects, RateLimit: defaultRateLimit},
 		},
 		{
 			name: "whitespace out dir falls back to the default",
 			env:  map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_OUT_DIR": "   "},
-			want: Config{Token: "tok", WorkspaceGID: "123", OutDir: "out"},
+			want: Config{Token: "tok", WorkspaceGID: "123", OutDir: "out", PollUsers: defaultPollUsers, PollProjects: defaultPollProjects, RateLimit: defaultRateLimit},
 		},
 		{
 			name:   "values from .env",
 			dotenv: "ASANA_TOKEN=filetok\nASANA_WORKSPACE_ID=456\n",
-			want:   Config{Token: "filetok", WorkspaceGID: "456", OutDir: "out"},
+			want:   Config{Token: "filetok", WorkspaceGID: "456", OutDir: "out", PollUsers: defaultPollUsers, PollProjects: defaultPollProjects, RateLimit: defaultRateLimit},
 		},
 		{
 			name:   "environment beats .env",
 			env:    map[string]string{"ASANA_TOKEN": "envtok", "ASANA_WORKSPACE_ID": "789"},
 			dotenv: "ASANA_TOKEN=filetok\nASANA_WORKSPACE_ID=456\n",
-			want:   Config{Token: "envtok", WorkspaceGID: "789", OutDir: "out"},
+			want:   Config{Token: "envtok", WorkspaceGID: "789", OutDir: "out", PollUsers: defaultPollUsers, PollProjects: defaultPollProjects, RateLimit: defaultRateLimit},
 		},
 		{
 			// As produced by an unresolved CI secret or "docker run -e VAR".
 			name:   "empty environment does not shadow .env",
 			env:    map[string]string{"ASANA_TOKEN": "", "ASANA_WORKSPACE_ID": ""},
 			dotenv: "ASANA_TOKEN=filetok\nASANA_WORKSPACE_ID=456\n",
-			want:   Config{Token: "filetok", WorkspaceGID: "456", OutDir: "out"},
+			want:   Config{Token: "filetok", WorkspaceGID: "456", OutDir: "out", PollUsers: defaultPollUsers, PollProjects: defaultPollProjects, RateLimit: defaultRateLimit},
+		},
+		{
+			name: "polling and rate limit from the environment",
+			env: map[string]string{
+				"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123",
+				"ASANA_POLL_USERS": "2m", "ASANA_POLL_PROJECTS": "15s", "ASANA_RATE_LIMIT": "1500",
+			},
+			want: Config{
+				Token: "tok", WorkspaceGID: "123", OutDir: "out",
+				PollUsers: 2 * time.Minute, PollProjects: 15 * time.Second, RateLimit: 1500,
+			},
+		},
+		{
+			name:    "a zero interval is rejected",
+			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_POLL_PROJECTS": "0s"},
+			wantErr: []string{"ASANA_POLL_PROJECTS", "more than zero"},
+		},
+		{
+			name:    "a negative interval is rejected",
+			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_POLL_USERS": "-5m"},
+			wantErr: []string{"ASANA_POLL_USERS", "more than zero"},
+		},
+		{
+			name:    "an unparseable interval is rejected",
+			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_POLL_USERS": "soon"},
+			wantErr: []string{"ASANA_POLL_USERS", "not a duration"},
+		},
+		{
+			name:    "a non numeric rate limit is rejected",
+			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_RATE_LIMIT": "lots"},
+			wantErr: []string{"ASANA_RATE_LIMIT", "not a number"},
+		},
+		{
+			name:    "a zero rate limit is rejected",
+			env:     map[string]string{"ASANA_TOKEN": "tok", "ASANA_WORKSPACE_ID": "123", "ASANA_RATE_LIMIT": "0"},
+			wantErr: []string{"ASANA_RATE_LIMIT", "more than zero"},
+		},
+		{
+			name:    "every problem is reported at once",
+			env:     map[string]string{"ASANA_RATE_LIMIT": "lots", "ASANA_POLL_USERS": "soon"},
+			wantErr: []string{"ASANA_TOKEN", "ASANA_WORKSPACE_ID", "ASANA_RATE_LIMIT", "ASANA_POLL_USERS"},
 		},
 		{
 			name:    "both missing reported together",

@@ -20,11 +20,10 @@ import (
 const (
 	defaultBaseURL = "https://app.asana.com/api/1.0"
 
-	// Asana allows 150 requests per minute on the free tier, 1500 on paid
-	// plans. A burst of 1 spreads requests evenly; the margin below the cap is
-	// deliberate, since pacing at exactly 150 puts ticks at both ends of a
-	// closed 60 second window and so allows 151 requests inside it.
-	requestsPerMinute = 145
+	// Percentage of the plan's limit we actually pace at. Running at exactly
+	// the limit puts ticks at both ends of a closed 60 second window, which
+	// permits one request more than allowed.
+	paceHeadroom = 97
 
 	pageSize       = 100 // Asana's maximum.
 	maxAttempts    = 3
@@ -51,11 +50,13 @@ type Client struct {
 	log       *slog.Logger
 }
 
-func New(token, workspace string, log *slog.Logger) *Client {
+// New builds a client paced for a plan allowing requestsPerMinute requests,
+// which is 150 on Asana's free tier and 1500 on paid plans.
+func New(token, workspace string, requestsPerMinute int, log *slog.Logger) *Client {
 	return &Client{
 		baseURL:   defaultBaseURL,
 		http:      &http.Client{Timeout: requestTimeout},
-		limiter:   rate.NewLimiter(rate.Every(time.Minute/requestsPerMinute), 1),
+		limiter:   rate.NewLimiter(pace(requestsPerMinute), 1),
 		token:     token,
 		workspace: workspace,
 		log:       log,
@@ -187,6 +188,16 @@ func (c *Client) try(ctx context.Context, endpoint string, dest any, attempt int
 
 // baseBackoff is a variable so tests need not wait seconds.
 var baseBackoff = time.Second
+
+// pace converts a plan's requests-per-minute allowance into the rate we issue
+// at, keeping a little back so a burst boundary cannot tip us over.
+func pace(requestsPerMinute int) rate.Limit {
+	if requestsPerMinute < 1 {
+		requestsPerMinute = 1
+	}
+	perMinute := max(requestsPerMinute*paceHeadroom/100, 1)
+	return rate.Every(time.Minute / time.Duration(perMinute))
+}
 
 // backoff grows 1s, 2s, 4s across attempts.
 func backoff(attempt int) time.Duration {
