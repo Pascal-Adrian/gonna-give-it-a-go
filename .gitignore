@@ -54,6 +54,10 @@ debug.test
 # air / reflex live-reload output
 tmp/
 
+# ---- Extracted data ----
+# Asana exports contain user email addresses; never commit them.
+out/
+
 # ---- Secrets & local config ----
 .env
 .env.*
